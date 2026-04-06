@@ -1,0 +1,9 @@
+node_modules/
+node/node_modules/
+dist/
+*.zxp
+*.log
+.DS_Store
+Thumbs.db
+package-lock.json
+node/package-lock.json
