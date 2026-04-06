@@ -1,0 +1,424 @@
+/**
+ * DeepClean v2 — NODE 3: Execution Engine
+ * ExtendScript ES3-compatible
+ *
+ * Called from panel with manifestPath argument substituted.
+ * All operations wrapped in ONE Undo Group.
+ *
+ * Steps:
+ *   1. Read manifest_execution.json
+ *   2. TIMELINE: remove layers not in whitelist (descending index order)
+ *   3. LIMBO: move unused items to _LIMBO_DeepClean (never delete)
+ *   4. DC_ANCHOR: create anchor comp, add external comps as disabled guide layers
+ *   5. PRUNING: selectively remove unrequired layers from external comps
+ */
+
+// ─── ES3 Polyfills ───────────────────────────────────────────────────────────
+(function () {
+  if (!Array.prototype.indexOf) {
+    Array.prototype.indexOf = function (s, f) {
+      f = f || 0;
+      for (var i = f; i < this.length; i++) { if (this[i] === s) return i; }
+      return -1;
+    };
+  }
+  if (!Array.prototype.forEach) {
+    Array.prototype.forEach = function (fn, ctx) {
+      for (var i = 0; i < this.length; i++) fn.call(ctx, this[i], i, this);
+    };
+  }
+  if (!Array.prototype.sort) {} // native
+})();
+
+// ─── Safe JSON parse (uses built-in where available, eval fallback) ───────────
+function DC_parseJSON(str) {
+  if (typeof JSON !== 'undefined' && JSON.parse) {
+    return JSON.parse(str);
+  }
+  // ES3 fallback — safe because we control the source
+  return eval('(' + str + ')');
+}
+
+// ─── Read entire file as UTF-8 string ─────────────────────────────────────────
+function DC_readFile(fsPath) {
+  var f = new File(fsPath);
+  if (!f.exists) throw new Error('File not found: ' + fsPath);
+  f.encoding = 'UTF-8';
+  f.open('r');
+  var s = f.read();
+  f.close();
+  return s;
+}
+
+// ─── Find project item by numeric id ─────────────────────────────────────────
+function DC_findItemById(proj, id) {
+  var n = proj.items.length;
+  for (var i = 1; i <= n; i++) {
+    try { if (proj.items[i].id === id) return proj.items[i]; } catch (e) {}
+  }
+  return null;
+}
+
+// ─── Find CompItem by numeric id ─────────────────────────────────────────────
+function DC_findCompById(proj, id) {
+  var n = proj.items.length;
+  for (var i = 1; i <= n; i++) {
+    try {
+      var item = proj.items[i];
+      if (item instanceof CompItem && item.id === id) return item;
+    } catch (e) {}
+  }
+  return null;
+}
+
+// ─── Find or create FolderItem ────────────────────────────────────────────────
+function DC_findOrCreateFolder(proj, name, parent) {
+  parent = parent || proj.rootFolder;
+  var n = proj.items.length;
+  for (var i = 1; i <= n; i++) {
+    try {
+      var item = proj.items[i];
+      if (item instanceof FolderItem &&
+          item.name === name &&
+          item.parentFolder === parent) {
+        return item;
+      }
+    } catch (e) {}
+  }
+  var folder = proj.items.addFolder(name);
+  folder.parentFolder = parent;
+  return folder;
+}
+
+// ─── Sort descending (ES3 safe) ───────────────────────────────────────────────
+function DC_sortDesc(arr) {
+  return arr.slice().sort(function (a, b) { return b - a; });
+}
+
+// ─── STEP 1: Timeline cleanup (ID-Based) ──────────────────────────────────────
+function DC_cleanTimelines(proj, manifest, log) {
+  log.push('[STEP1] Timeline cleanup begin');
+
+  var layersToRemove = manifest.layersToRemove || [];
+  if (layersToRemove.length === 0) {
+    log.push('[STEP1] Nothing to remove.');
+    return;
+  }
+
+  // Group by compId
+  var removeByComp = {};
+  for (var j = 0; j < layersToRemove.length; j++) {
+    var r = layersToRemove[j];
+    var ck = String(r.compId);
+    if (!removeByComp[ck]) removeByComp[ck] = [];
+    removeByComp[ck].push(r.layerId);
+  }
+
+  // Build whitelist lookup { compId_layerId: true } to prevent disaster
+  var whitelist = manifest.whitelist || [];
+  var keepKey = {};
+  for (var w = 0; w < whitelist.length; w++) {
+    keepKey[String(whitelist[w].compId) + '_' + String(whitelist[w].layerId)] = true;
+  }
+
+  for (var compIdStr in removeByComp) {
+    var comp = DC_findCompById(proj, parseInt(compIdStr, 10));
+    if (!comp) {
+      log.push('[STEP1][WARN] Comp id ' + compIdStr + ' not found — skipped');
+      continue;
+    }
+
+    var idsToRemove = removeByComp[compIdStr];
+    var removed = 0;
+    var guarded = 0;
+
+    // Loop REVERSO no total de layers nativo por segurança
+    for (var i = comp.numLayers; i >= 1; i--) {
+      try {
+        var layer = comp.layer(i);
+        var lyrId = layer.id;
+        
+        var marked = false;
+        for (var k = 0; k < idsToRemove.length; k++) {
+           if (idsToRemove[k] === lyrId) { marked = true; break; }
+        }
+        
+        if (marked) {
+          if (keepKey[compIdStr + '_' + lyrId]) {
+             guarded++;
+          } else {
+             layer.remove();
+             removed++;
+          }
+        }
+      } catch(e) {
+        log.push('[STEP1][WARN] err removing layer in "' + comp.name + '": ' + e.message);
+      }
+    }
+    
+    log.push('[STEP1] "' + comp.name + '": removed=' + removed + ' guarded=' + guarded);
+  }
+}
+
+// ─── STEP 2: Move items into _LIMBO_DeepClean ────────────────────────────────
+function DC_organiseLimbo(proj, manifest, log) {
+  log.push('[STEP2] LIMBO organisation begin');
+
+  var itemsToMove = manifest.itemsToMoveToLimbo || [];
+  if (itemsToMove.length === 0) {
+    log.push('[STEP2] No items to move.');
+    return;
+  }
+
+  // Create root LIMBO folder
+  var limboRoot    = DC_findOrCreateFolder(proj, '_LIMBO_DeepClean', proj.rootFolder);
+  var orphanFolder = DC_findOrCreateFolder(proj, 'ORPHANS', limboRoot);
+
+  // Per-comp folders (created on demand)
+  var compFolderCache = {};
+
+  var moved    = 0;
+  var notFound = 0;
+
+  for (var i = 0; i < itemsToMove.length; i++) {
+    var entry = itemsToMove[i];
+    var item  = DC_findItemById(proj, entry.id);
+
+    if (!item) { notFound++; continue; }
+
+    // Never move the LIMBO folder itself
+    if (item instanceof FolderItem && item.name === '_LIMBO_DeepClean') continue;
+
+    // Determine target sub-folder
+    var dest;
+    if (entry.ownerCompId) {
+      var ck2 = String(entry.ownerCompId);
+      if (!compFolderCache[ck2]) {
+        var folderName = (entry.ownerCompName || ('Comp_' + ck2)).substring(0, 60);
+        compFolderCache[ck2] = DC_findOrCreateFolder(proj, folderName, limboRoot);
+      }
+      dest = compFolderCache[ck2];
+    } else {
+      dest = orphanFolder;
+    }
+
+    // Prefix name with [DC] if not already
+    if (item.name.indexOf('[DC]') !== 0) {
+      try { item.name = '[DC] ' + item.name; } catch (e) {}
+    }
+
+    // Move
+    try {
+      item.parentFolder = dest;
+      moved++;
+    } catch (e) {
+      log.push('[STEP2][WARN] Could not move "' + item.name + '": ' + e.message);
+    }
+  }
+
+  log.push('[STEP2] moved=' + moved + ' notFound=' + notFound);
+}
+
+// ─── STEP 3: DC_ANCHOR + external comp pruning ───────────────────────────────
+function DC_handleExternalComps(proj, manifest, log) {
+  log.push('[STEP3] DC_ANCHOR / external comp handling begin');
+
+  var externalComps = manifest.externalComps || [];
+  if (externalComps.length === 0) {
+    log.push('[STEP3] No external comps.');
+    return;
+  }
+
+  // Find or create **DC_ANCHOR** comp
+  var anchor = null;
+  for (var i = 1; i <= proj.items.length; i++) {
+    try {
+      var it = proj.items[i];
+      if (it instanceof CompItem && it.name === '**DC_ANCHOR**') { anchor = it; break; }
+    } catch (e) {}
+  }
+  if (!anchor) {
+    // Determine settings from first available comp
+    var w = 1920, h = 1080, fr = 24;
+    for (var j = 1; j <= proj.items.length; j++) {
+      try {
+        var c = proj.items[j];
+        if (c instanceof CompItem && c.name !== '**DC_ANCHOR**') {
+          w  = c.width;
+          h  = c.height;
+          fr = c.frameRate;
+          break;
+        }
+      } catch (e) {}
+    }
+    anchor = proj.items.addComp('**DC_ANCHOR**', w, h, 1, 1 / fr, fr);
+    log.push('[STEP3] Created **DC_ANCHOR** ' + w + 'x' + h + ' @' + fr);
+  }
+
+  for (var e = 0; e < externalComps.length; e++) {
+    var extEntry  = externalComps[e];
+    var extComp   = DC_findCompById(proj, extEntry.compId);
+    if (!extComp) {
+      log.push('[STEP3][WARN] External comp id ' + extEntry.compId + ' not found');
+      continue;
+    }
+
+    // ── Add to DC_ANCHOR (if not already) ────────────────────────────────────
+    var alreadyIn = false;
+    for (var li = 1; li <= anchor.numLayers; li++) {
+      try {
+        var al = anchor.layer(li);
+        if (al instanceof AVLayer && al.source && al.source.id === extComp.id) {
+          alreadyIn = true; break;
+        }
+      } catch (e2) {}
+    }
+    if (!alreadyIn) {
+      try {
+        var newLyr     = anchor.layers.add(extComp);
+        newLyr.enabled    = false;
+        newLyr.guideLayer = true;
+        newLyr.shy        = true;
+        log.push('[STEP3] Added "' + extComp.name + '" to DC_ANCHOR');
+      } catch (ex) {
+        log.push('[STEP3][WARN] Cannot add "' + extComp.name + '" to DC_ANCHOR: ' + ex.message);
+      }
+    }
+
+    // ── Selective pruning inside external comp ────────────────────────────────
+    // Empty requiredLayers means "keep all"
+    var requiredLayers = extEntry.requiredLayers || [];
+    if (requiredLayers.length === 0) {
+      log.push('[STEP3] "' + extComp.name + '": no pruning');
+      continue;
+    }
+
+    var reqMap = {};
+    for (var ri = 0; ri < requiredLayers.length; ri++) {
+      reqMap[String(requiredLayers[ri])] = true;
+    }
+
+    // Sort descending to avoid shifting when pruning
+    var pruned = 0;
+    for (var li = extComp.numLayers; li >= 1; li--) {
+      try {
+        var layer = extComp.layer(li);
+        if (!reqMap[String(layer.id)]) {
+           layer.remove();
+           pruned++;
+        }
+      } catch (ex2) {
+        log.push('[STEP3][WARN] prune layer ' + li + ' in "' + extComp.name + '": ' + ex2.message);
+      }
+    }
+    log.push('[STEP3] Pruned ' + pruned + ' layers from "' + extComp.name + '"');
+  }
+}
+
+// ─── STEP 4: Protocol COLLECT ────────────────────────────────────────────────
+function DC_protocolCollect(proj, manifest, log) {
+  var ids = manifest.compsToCollect || [];
+  if (ids.length === 0) return;
+
+  var collectComp = null;
+  for (var i = 1; i <= proj.numItems; i++) {
+    var it = proj.item(i);
+    if (it instanceof CompItem && it.name === '__COLLECT__') {
+       collectComp = it; break;
+    }
+  }
+  if (!collectComp) {
+     try { collectComp = proj.items.addComp('__COLLECT__', 1920, 1080, 1, 10, 30); } catch(e) {}
+  }
+  if (!collectComp) return;
+
+  var collected = 0;
+  for (var j = 0; j < ids.length; j++) {
+    var sourceComp = DC_findCompById(proj, ids[j]);
+    if (sourceComp) {
+       try {
+         var added = collectComp.layers.add(sourceComp);
+         added.enabled = false;
+         added.guideLayer = true;
+         collected++;
+       } catch(e) {}
+    }
+  }
+  log.push('[STEP4] Collected ' + collected + ' external surviving comps into __COLLECT__');
+}
+
+// ─── STEP 5: Final Sweep (Orphans) ──────────────────────────────────────────
+function DC_finalSweep(proj, log) {
+  var orphanFolder = null;
+  var limboFolder = null;
+  for (var f = 1; f <= proj.numItems; f++) {
+    var it = proj.item(f);
+    if (it instanceof FolderItem) {
+       if (it.name === '_ORPHANS') orphanFolder = it;
+       if (it.name === '_LIMBO_DeepClean') limboFolder = it;
+    }
+  }
+  if (!orphanFolder) {
+    if (!limboFolder) limboFolder = proj.items.addFolder('_LIMBO_DeepClean');
+    orphanFolder = proj.items.addFolder('_ORPHANS');
+    orphanFolder.parentFolder = limboFolder;
+  }
+  var orphaned = 0;
+  for (var i = 1; i <= proj.numItems; i++) {
+    try {
+      var item = proj.item(i);
+      if (item instanceof FolderItem) continue;
+      if (item instanceof CompItem) continue; 
+      
+      if (item.usedIn && item.usedIn.length === 0) {
+        if (item.parentFolder !== orphanFolder) {
+          item.parentFolder = orphanFolder;
+        }
+        if (item.name.indexOf('[DC]') !== 0) {
+          item.name = '[DC] ' + item.name;
+        }
+        orphaned++;
+      }
+    } catch(e) {}
+  }
+  log.push('[STEP5] Final Sweep orphaned leftover footages: ' + orphaned);
+}
+
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
+function DC_runExecution(manifestPath) {
+  var log = [];
+  log.push('[DC] Execution start: ' + manifestPath);
+
+  // Validate manifest path
+  var mFile = new File(manifestPath);
+  if (!mFile.exists) return 'ERROR|Manifest not found: ' + manifestPath;
+
+  // Read and parse manifest
+  var manifest;
+  try {
+    manifest = DC_parseJSON(DC_readFile(manifestPath));
+  } catch (e) {
+    return 'ERROR|Could not parse manifest: ' + e.message;
+  }
+
+  // ── Single Undo Group ─────────────────────────────────────────────────────
+  app.beginUndoGroup('DeepClean v2');
+  try {
+    var proj = app.project;
+    DC_cleanTimelines(proj, manifest, log);
+    DC_organiseLimbo(proj, manifest, log);
+    DC_handleExternalComps(proj, manifest, log);
+    DC_protocolCollect(proj, manifest, log);
+    DC_finalSweep(proj, log);
+  } catch (err) {
+    app.endUndoGroup();
+    return 'ERROR|' + err.message + '\n--- LOG ---\n' + log.join('\n');
+  }
+  app.endUndoGroup();
+
+  log.push('[DC] Execution complete.');
+  return 'SUCCESS|' + log.join('\n');
+}
+
+// Entry point — _DC_MANIFEST_PATH_ is replaced by the panel before eval
+DC_runExecution(_DC_MANIFEST_PATH_);
