@@ -1,0 +1,11 @@
+{
+  "name": "deepclean-analysis-engine-source",
+  "version": "2.0.0",
+  "description": "Source dependencies for DeepClean analysis engine. NOT needed by end users \u2014 use analyze.bundle.js which includes all deps.",
+  "private": true,
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "sax": "^1.4.1"
+  },
+  "note": "Run 'node ../build.js' from the project root to rebuild analyze.bundle.js after editing analyze.src.js"
+}
